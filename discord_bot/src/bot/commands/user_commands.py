@@ -50,10 +50,121 @@ class UserCommands:
     
     def register_commands(self):
         """Register all user commands with the bot."""
+        self.bot.tree.add_command(self._help_command())
         self.bot.tree.add_command(self._link_command())
         self.bot.tree.add_command(self._unlink_command())
         self.bot.tree.add_command(self._getstats_command())
         self.bot.tree.add_command(self._halloffame_command())
+        self.bot.tree.add_command(self._repos_command())
+
+    def _help_command(self):
+        """Create the help command."""
+        @app_commands.command(name="help", description="How DisgitBot works and how to get started")
+        async def help_cmd(interaction: discord.Interaction):
+            await interaction.response.defer(ephemeral=True)
+
+            is_admin = interaction.user.guild_permissions.administrator
+
+            # --- Embed 1: Getting Started ---
+            start_embed = discord.Embed(
+                title="DisgitBot — Getting Started",
+                description=(
+                    "DisgitBot tracks GitHub contributions for your organization "
+                    "and displays stats, leaderboards, and auto-assigns roles in Discord."
+                ),
+                color=discord.Color.blurple()
+            )
+            start_embed.add_field(
+                name="1️⃣  Setup (admin, one-time)",
+                value=(
+                    "`/setup` → click link → install GitHub App on your org\n"
+                    "Choose **All repositories** for automatic tracking of new repos."
+                ),
+                inline=False
+            )
+            start_embed.add_field(
+                name="2️⃣  Link your account",
+                value="`/link` → authorize with GitHub → your stats are now tracked",
+                inline=False
+            )
+            start_embed.add_field(
+                name="3️⃣  View stats",
+                value=(
+                    "`/getstats` — your personal contribution stats\n"
+                    "`/halloffame` — top 3 contributors leaderboard\n"
+                    "`/repos` — list all tracked repositories"
+                ),
+                inline=False
+            )
+
+            # --- Embed 2: Good to Know ---
+            faq_embed = discord.Embed(
+                title="Good to Know",
+                color=discord.Color.greyple()
+            )
+            faq_embed.add_field(
+                name="📊  When does data update?",
+                value=(
+                    "Automatically every night (midnight UTC).\n"
+                    "Admins can force refresh with `/sync`.\n"
+                    "After first setup, wait ~5–10 minutes for initial data."
+                ),
+                inline=False
+            )
+            faq_embed.add_field(
+                name="📦  New repos not showing up?",
+                value=(
+                    "If the GitHub App was installed with **Selected repositories**, "
+                    "new repos won't be tracked automatically.\n"
+                    "→ Go to **GitHub → Settings → GitHub Apps → Configure** "
+                    "and add the new repo, or switch to **All repositories**."
+                ),
+                inline=False
+            )
+            faq_embed.add_field(
+                name="👤  My stats are empty?",
+                value=(
+                    "Make sure you've run `/link` first.\n"
+                    "If you just set up, data may not be synced yet — "
+                    "try `/sync` (admin) or wait for the next automatic sync."
+                ),
+                inline=False
+            )
+
+            embeds = [start_embed, faq_embed]
+
+            # --- Embed 3: Admin Commands (only shown to admins) ---
+            if is_admin:
+                admin_embed = discord.Embed(
+                    title="Admin Commands",
+                    color=discord.Color.orange()
+                )
+                admin_embed.add_field(
+                    name="Commands",
+                    value=(
+                        "`/setup` — connect or check GitHub org connection\n"
+                        "`/sync` — manually trigger data refresh (12h cooldown)\n"
+                        "`/configure roles` — auto-assign roles based on contributions\n"
+                        "`/setup_voice_stats` — voice channel repo stats display\n"
+                        "`/check_permissions` — verify bot has required permissions"
+                    ),
+                    inline=False
+                )
+                admin_embed.add_field(
+                    name="Setup flow for organizations",
+                    value=(
+                        "If a **non-owner** member runs `/setup`, GitHub sends "
+                        "an install **request** to the org owner.\n"
+                        "After the owner approves on GitHub, "
+                        "an admin or the owner must run `/setup` again in Discord to complete the link."
+                    ),
+                    inline=False
+                )
+                embeds.append(admin_embed)
+
+            await interaction.followup.send(embeds=embeds, ephemeral=True)
+
+        return help_cmd
     
     def _link_command(self):
         """Create the link command."""
@@ -442,4 +553,96 @@ class UserCommands:
         
         embed.set_footer(text=f"Last updated: {last_updated or 'Unknown'}")
         return embed
-    
+
+    def _repos_command(self):
+        """Create the repos command to list tracked repositories."""
+        @app_commands.command(name="repos", description="List repositories tracked by DisgitBot on this server")
+        @app_commands.guild_only()
+        async def repos(interaction: discord.Interaction):
+            """Shows all repositories the GitHub App can access for this server."""
+            await self._safe_defer(interaction)
+
+            try:
+                mt_client = get_mt_client()
+                guild_id = str(interaction.guild_id)
+                server_config = await asyncio.to_thread(mt_client.get_server_config, guild_id) or {}
+
+                if not server_config.get('setup_completed'):
+                    await self._safe_followup(
+                        interaction,
+                        "This server hasn't been set up yet. An admin needs to run `/setup` first."
+                    )
+                    return
+
+                installation_id = server_config.get('github_installation_id')
+                github_org = server_config.get('github_org', 'Unknown')
+
+                if not installation_id:
+                    await self._safe_followup(
+                        interaction,
+                        f"This server is connected to **{github_org}** but has no GitHub App installation ID.\n"
+                        f"An admin should run `/setup` to reconnect."
+                    )
+                    return
+
+                # Get installation access token and fetch repos
+                from ...services.github_app_service import GitHubAppService
+                from ...services.github_service import GitHubService
+
+                gh_app = GitHubAppService()
+                token = await asyncio.to_thread(gh_app.get_installation_access_token, installation_id)
+
+                if not token:
+                    await self._safe_followup(
+                        interaction,
+                        "Couldn't authenticate with GitHub. The app installation may have been removed.\n"
+                        "An admin should check the GitHub App settings or run `/setup` again."
+                    )
+                    return
+
+                gh_service = GitHubService(
+                    repo_owner=github_org,
+                    token=token,
+                    installation_id=installation_id
+                )
+                repos_list = await asyncio.to_thread(gh_service.fetch_installation_repositories)
+
+                if not repos_list:
+                    embed = discord.Embed(
+                        title="📂 Tracked Repositories",
+                        description=f"Connected to **{github_org}** but no repositories found.",
+                        color=0xfee75c  # yellow
+                    )
+                    embed.set_footer(text="The GitHub App may need repository access permissions updated.")
+                    await self._safe_followup(interaction, embed, embed=True)
+                    return
+
+                # Build a nice embed
+                embed = discord.Embed(
+                    title="📂 Tracked Repositories",
+                    description=f"**{github_org}** — {len(repos_list)} {'repository' if len(repos_list) == 1 else 'repositories'} tracked",
+                    color=0x43b581  # green
+                )
+
+                # Show repos in chunks (Discord embed field limit is 1024 chars)
+                repo_names = [f"• `{r['owner']}/{r['name']}`" for r in repos_list]
+                chunk_size = 20
+                for i in range(0, len(repo_names), chunk_size):
+                    chunk = repo_names[i:i + chunk_size]
+                    field_name = "Repositories" if i == 0 else f"Repositories (cont.)"
+                    embed.add_field(
+                        name=field_name,
+                        value="\n".join(chunk),
+                        inline=False
+                    )
+
+                embed.set_footer(text="Repos are set in GitHub App installation settings. Stats sync daily at midnight UTC.")
+                await self._safe_followup(interaction, embed, embed=True)
+
+            except Exception as e:
+                await self._safe_followup(interaction, f"Error fetching repositories: {str(e)}")
+                print(f"Error in repos command: {e}")
+                import traceback
+                traceback.print_exc()
+
+        return repos

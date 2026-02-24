@@ -162,8 +162,13 @@ class GuildService:
                 return existing_roles.get(role_name)
             return None
 
+        # Ensure all members are cached before iterating
+        if not guild.chunked:
+            await guild.chunk()
+        
         # Update users
         updated_count = 0
+        print(f"Guild has {len(guild.members)} members, user_mappings has {len(user_mappings)} entries")
         for member in guild.members:
             github_username = user_mappings.get(str(member.id))
             if not github_username or github_username not in contributions:
@@ -223,9 +228,26 @@ class GuildService:
             print(f"Updating channels in guild: {guild.name}")
             
             # Find or create stats category
-            stats_category = discord.utils.get(guild.categories, name="REPOSITORY STATS")
-            if not stats_category:
+            # Use a list scan instead of discord.utils.get so we can detect and
+            # clean up duplicate categories (can appear if setup and the pipeline
+            # both try to create the category at the same time).
+            all_stats_categories = [c for c in guild.categories if c.name == "REPOSITORY STATS"]
+            if not all_stats_categories:
                 stats_category = await guild.create_category("REPOSITORY STATS")
+            else:
+                stats_category = all_stats_categories[0]
+                # Delete any extras, including all their channels
+                for dup in all_stats_categories[1:]:
+                    for ch in dup.channels:
+                        try:
+                            await ch.delete()
+                        except Exception:
+                            pass
+                    try:
+                        await dup.delete()
+                        print(f"Deleted duplicate REPOSITORY STATS category in {guild.name}")
+                    except Exception as e:
+                        print(f"Could not delete duplicate category in {guild.name}: {e}")
             
             # Channel names for all repository metrics
             channels_to_update = [
